@@ -206,6 +206,25 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		runtimeHost.setRebindSession(undefined);
 	});
 
+	it("notifies rebind observers after the primary callback and supports unsubscribe", async () => {
+		const phases: string[] = [];
+		const { runtimeHost } = await createRuntimeHost(() => {});
+		runtimeHost.setRebindSession(async () => {
+			phases.push("primary");
+		});
+		const unsubscribe = runtimeHost.subscribeRebindSession(async () => {
+			phases.push("observer");
+		});
+
+		await runtimeHost.newSession();
+		expect(phases).toEqual(["primary", "observer"]);
+
+		phases.length = 0;
+		unsubscribe();
+		await runtimeHost.newSession();
+		expect(phases).toEqual(["primary"]);
+	});
+
 	it("emits session_before_fork and session_start and honors cancellation", async () => {
 		const events: RecordedSessionEvent[] = [];
 		let cancelNextFork = false;

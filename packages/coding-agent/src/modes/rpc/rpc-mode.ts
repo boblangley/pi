@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import type { Readable } from "node:stream";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -47,19 +48,55 @@ export type {
 	RpcSessionState,
 } from "./rpc-types.ts";
 
+export interface RpcConnectionOptions {
+	input: Readable;
+	write: (line: string) => void;
+	waitForOutput?: () => Promise<void>;
+}
+
+interface RpcTransportOptions extends RpcConnectionOptions {
+	bindExtensions: boolean;
+	manageProcess: boolean;
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
 export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
 	takeOverStdout();
+	await runRpcTransport(runtimeHost, {
+		input: process.stdin,
+		write: writeRawStdout,
+		waitForOutput: waitForRawStdoutBackpressure,
+		bindExtensions: true,
+		manageProcess: true,
+	});
+	return new Promise(() => {});
+}
+
+/**
+ * Serve one RPC connection without taking ownership of process lifecycle or
+ * extension UI bindings.
+ */
+export async function runRpcConnection(runtimeHost: AgentSessionRuntime, options: RpcConnectionOptions): Promise<void> {
+	await runRpcTransport(runtimeHost, {
+		...options,
+		bindExtensions: false,
+		manageProcess: false,
+	});
+}
+
+async function runRpcTransport(runtimeHost: AgentSessionRuntime, options: RpcTransportOptions): Promise<void> {
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
+	let unsubscribeRebind: (() => void) | undefined;
 
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		writeRawStdout(serializeJsonLine(obj));
+		options.write(serializeJsonLine(obj));
 	};
+	const waitForOutput = options.waitForOutput ?? (async () => {});
 
 	const success = <T extends RpcCommand["type"]>(
 		id: string | undefined,
@@ -310,45 +347,48 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		},
 	});
 
-	runtimeHost.setRebindSession(async () => {
-		await rebindSession();
-	});
-
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
-		await session.bindExtensions({
-			uiContext: createExtensionUIContext(),
-			mode: "rpc",
-			commandContextActions: {
-				waitForIdle: () => session.waitForIdle(),
-				newSession: async (options) => runtimeHost.newSession(options),
-				fork: async (entryId, forkOptions) => {
-					const result = await runtimeHost.fork(entryId, forkOptions);
-					return { cancelled: result.cancelled };
+		if (options.bindExtensions) {
+			await session.bindExtensions({
+				uiContext: createExtensionUIContext(),
+				mode: "rpc",
+				commandContextActions: {
+					waitForIdle: () => session.waitForIdle(),
+					newSession: async (options) => runtimeHost.newSession(options),
+					fork: async (entryId, forkOptions) => {
+						const result = await runtimeHost.fork(entryId, forkOptions);
+						return { cancelled: result.cancelled };
+					},
+					navigateTree: async (targetId, options) => {
+						const result = await session.navigateTree(targetId, {
+							summarize: options?.summarize,
+							customInstructions: options?.customInstructions,
+							replaceInstructions: options?.replaceInstructions,
+							label: options?.label,
+						});
+						return { cancelled: result.cancelled };
+					},
+					switchSession: async (sessionPath, options) => {
+						return runtimeHost.switchSession(sessionPath, options);
+					},
+					reload: async () => {
+						await session.reload();
+					},
 				},
-				navigateTree: async (targetId, options) => {
-					const result = await session.navigateTree(targetId, {
-						summarize: options?.summarize,
-						customInstructions: options?.customInstructions,
-						replaceInstructions: options?.replaceInstructions,
-						label: options?.label,
+				shutdownHandler: () => {
+					shutdownRequested = true;
+				},
+				onError: (err) => {
+					output({
+						type: "extension_error",
+						extensionPath: err.extensionPath,
+						event: err.event,
+						error: err.error,
 					});
-					return { cancelled: result.cancelled };
 				},
-				switchSession: async (sessionPath, options) => {
-					return runtimeHost.switchSession(sessionPath, options);
-				},
-				reload: async () => {
-					await session.reload();
-				},
-			},
-			shutdownHandler: () => {
-				shutdownRequested = true;
-			},
-			onError: (err) => {
-				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-			},
-		});
+			});
+		}
 
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
@@ -358,10 +398,22 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				void checkShutdownRequested();
 			}
 		});
-		unsubscribeBackpressure = session.agent.subscribe(async () => {
-			await waitForRawStdoutBackpressure();
-		});
+		unsubscribeBackpressure = options.manageProcess
+			? session.agent.subscribe(async () => {
+					await waitForOutput();
+				})
+			: undefined;
 	};
+
+	if (options.bindExtensions) {
+		runtimeHost.setRebindSession(async () => {
+			await rebindSession();
+		});
+	} else {
+		unsubscribeRebind = runtimeHost.subscribeRebindSession(async () => {
+			await rebindSession();
+		});
+	}
 
 	const registerSignalHandlers = (): void => {
 		const signals: NodeJS.Signals[] = ["SIGTERM"];
@@ -380,7 +432,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	};
 
 	await rebindSession();
-	registerSignalHandlers();
+	if (options.manageProcess) {
+		registerSignalHandlers();
+	}
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
@@ -720,10 +774,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	 * Called after handling each command when waiting for the next command.
 	 */
 	let detachInput = () => {};
+	let resolveConnectionEnd: (() => void) | undefined;
+	const connectionEnded = new Promise<void>((resolve) => {
+		resolveConnectionEnd = resolve;
+	});
 
-	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
 		if (shuttingDown) {
-			process.exit(exitCode);
+			if (options.manageProcess) {
+				process.exit(exitCode);
+			}
+			return;
 		}
 		shuttingDown = true;
 		for (const cleanup of signalCleanupHandlers) {
@@ -731,12 +792,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
-		await runtimeHost.dispose();
+		unsubscribeRebind?.();
 		detachInput();
-		process.stdin.pause();
-		if (signal !== "SIGTERM") {
-			await flushRawStdout();
+		if (!options.manageProcess) {
+			resolveConnectionEnd?.();
+			return;
 		}
+		await runtimeHost.dispose();
+		options.input.pause();
+		if (signal !== "SIGTERM") await flushRawStdout();
 		process.exit(exitCode);
 	}
 
@@ -757,7 +821,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
 				),
 			);
-			await waitForRawStdoutBackpressure();
+			await waitForOutput();
 			return;
 		}
 
@@ -782,7 +846,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			const response = await handleCommand(command);
 			if (response) {
 				output(response);
-				await waitForRawStdoutBackpressure();
+				await waitForOutput();
 			}
 			await checkShutdownRequested();
 		} catch (commandError: unknown) {
@@ -793,25 +857,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					commandError instanceof Error ? commandError.message : String(commandError),
 				),
 			);
-			await waitForRawStdoutBackpressure();
+			await waitForOutput();
 		}
 	};
 
 	const onInputEnd = () => {
 		void shutdown();
 	};
-	process.stdin.on("end", onInputEnd);
+	options.input.on("end", onInputEnd);
+	options.input.on("close", onInputEnd);
 
 	detachInput = (() => {
-		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
+		const detachJsonl = attachJsonlLineReader(options.input, (line) => {
 			void handleInputLine(line);
 		});
 		return () => {
 			detachJsonl();
-			process.stdin.off("end", onInputEnd);
+			options.input.off("end", onInputEnd);
+			options.input.off("close", onInputEnd);
 		};
 	})();
 
-	// Keep process alive forever
-	return new Promise(() => {});
+	await connectionEnded;
 }

@@ -125,6 +125,21 @@ describe("parseArgs", () => {
 			expect(result.mode).toBe("rpc");
 		});
 
+		test("parses --rpc-socket", () => {
+			const result = parseArgs(["--rpc-socket", "/tmp/pi.sock"]);
+			expect(result.rpcSocket).toBe("/tmp/pi.sock");
+		});
+
+		test("requires a path for --rpc-socket", () => {
+			const result = parseArgs(["--rpc-socket"]);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--rpc-socket requires a path" }]);
+		});
+
+		test("rejects an empty --rpc-socket path", () => {
+			const result = parseArgs(["--rpc-socket", ""]);
+			expect(result.diagnostics).toEqual([{ type: "error", message: "--rpc-socket requires a path" }]);
+		});
+
 		test("parses --session", () => {
 			const result = parseArgs(["--session", "/path/to/session.jsonl"]);
 			expect(result.session).toBe("/path/to/session.jsonl");

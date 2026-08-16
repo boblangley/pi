@@ -22,6 +22,7 @@ export interface Args {
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
+	rpcSocket?: string;
 	name?: string;
 	noSession?: boolean;
 	session?: string;
@@ -82,6 +83,15 @@ export function parseArgs(args: string[]): Args {
 			const mode = args[++i];
 			if (mode === "text" || mode === "json" || mode === "rpc") {
 				result.mode = mode;
+			}
+		} else if (arg === "--rpc-socket") {
+			if (i + 1 < args.length && args[i + 1].length > 0 && !args[i + 1].startsWith("-")) {
+				result.rpcSocket = args[++i];
+			} else {
+				result.diagnostics.push({
+					type: "error",
+					message: "--rpc-socket requires a path",
+				});
 			}
 		} else if (arg === "--continue" || arg === "-c") {
 			result.continue = true;
@@ -267,6 +277,7 @@ ${chalk.bold("Options:")}
   --system-prompt <text>         System prompt (default: coding assistant prompt)
   --append-system-prompt <text>  Append text or file contents to the system prompt (can be used multiple times)
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --rpc-socket <path>            Serve RPC over a Unix socket alongside interactive mode
   --print, -p                    Non-interactive mode: process prompt and exit
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume

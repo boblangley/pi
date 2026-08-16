@@ -61,7 +61,13 @@ import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { builtInExtensions } from "./extensions/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
-import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
+import {
+	InteractiveMode,
+	type RpcSocketServer,
+	runPrintMode,
+	runRpcMode,
+	startRpcSocketServer,
+} from "./modes/index.ts";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
@@ -638,6 +644,10 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	if (parsed.rpcSocket && appMode !== "interactive") {
+		console.error(chalk.red("Error: --rpc-socket requires interactive mode"));
+		process.exit(1);
+	}
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
@@ -877,6 +887,10 @@ export async function main(args: string[], options?: MainOptions) {
 			appMode = "print";
 		}
 	}
+	if (parsed.rpcSocket && appMode !== "interactive") {
+		console.error(chalk.red("Error: --rpc-socket requires terminal input and output"));
+		process.exit(1);
+	}
 	time("readPipedStdin");
 
 	const { initialMessage, initialImages } = await prepareInitialMessage(
@@ -913,6 +927,10 @@ export async function main(args: string[], options?: MainOptions) {
 		console.error(chalk.red("Error: PI_STARTUP_BENCHMARK only supports interactive mode"));
 		process.exit(1);
 	}
+	if (startupBenchmark && parsed.rpcSocket) {
+		console.error(chalk.red("Error: PI_STARTUP_BENCHMARK does not support --rpc-socket"));
+		process.exit(1);
+	}
 
 	// RPC refreshes catalogs here in the background; interactive mode starts its refresh after TUI initialization.
 	if (!offlineMode && appMode === "rpc") {
@@ -928,6 +946,17 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
+		let rpcSocketServer: RpcSocketServer | undefined;
+		if (parsed.rpcSocket) {
+			try {
+				rpcSocketServer = await startRpcSocketServer(runtime, resolvePath(parsed.rpcSocket, cwd));
+			} catch (error: unknown) {
+				const message = error instanceof Error ? error.message : String(error);
+				console.error(chalk.red(`Error: Failed to start RPC socket: ${message}`));
+				await runtime.dispose();
+				process.exit(1);
+			}
+		}
 		const interactiveMode = new InteractiveMode(runtime, {
 			migratedProviders,
 			modelFallbackMessage,
@@ -958,7 +987,11 @@ export async function main(args: string[], options?: MainOptions) {
 		}
 
 		printTimings();
-		await interactiveMode.run();
+		try {
+			await interactiveMode.run();
+		} finally {
+			await rpcSocketServer?.close();
+		}
 	} else {
 		printTimings();
 		const exitCode = await runPrintMode(runtime, {

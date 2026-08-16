@@ -73,6 +73,7 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
  */
 export class AgentSessionRuntime {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
+	private readonly rebindSessionListeners = new Set<(session: AgentSession) => Promise<void>>();
 	private beforeSessionInvalidate?: () => void;
 	private _session: AgentSession;
 	private _services: AgentSessionServices;
@@ -116,6 +117,18 @@ export class AgentSessionRuntime {
 
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
 		this.rebindSession = rebindSession;
+	}
+
+	/**
+	 * Observe session replacement without taking ownership of the host's primary
+	 * rebind callback. Observers run after the primary callback so host UI state
+	 * is ready before auxiliary transports reattach to the new session.
+	 */
+	subscribeRebindSession(listener: (session: AgentSession) => Promise<void>): () => void {
+		this.rebindSessionListeners.add(listener);
+		return () => {
+			this.rebindSessionListeners.delete(listener);
+		};
 	}
 
 	/**
@@ -187,6 +200,9 @@ export class AgentSessionRuntime {
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
 		if (this.rebindSession) {
 			await this.rebindSession(this.session);
+		}
+		for (const listener of this.rebindSessionListeners) {
+			await listener(this.session);
 		}
 		if (withSession) {
 			await withSession(this.session.createReplacedSessionContext());
